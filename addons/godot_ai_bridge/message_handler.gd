@@ -416,6 +416,13 @@ func _handle_execute_gdscript(params: Dictionary) -> Dictionary:
 	var log_checkpoint: int = _get_log_checkpoint_line()
 	var script_source := "extends RefCounted\nfunc __mcp_exec(editor_interface: Variant, message_handler: Variant) -> Variant:\n"
 	script_source += _indent_code(code)
+	# Side-effect-only snippets (e.g. `print("hello")`) parse-fail under the
+	# typed `-> Variant:` wrapper because GDScript requires a typed-return
+	# function to have an explicit `return`. Append a safety-net `return null`
+	# unless the user's code already ends with one (avoids unreachable-code
+	# errors in strict-typing-enforced projects).
+	if not _code_ends_with_return(code):
+		script_source += "\treturn null\n"
 
 	var temp_script := GDScript.new()
 	temp_script.source_code = script_source
@@ -556,6 +563,22 @@ func _indent_code(code: String) -> String:
 	for line in lines:
 		indented.append("\t" + line)
 	return "\n".join(indented) + "\n"
+
+
+func _code_ends_with_return(code: String) -> bool:
+	# Walk lines from the end looking for the last non-empty, non-comment
+	# line. Return true if it begins with `return`. This is a deliberately
+	# simple heuristic; pathological cases (multi-line return expressions,
+	# return inside a string literal at end of file) are not handled.
+	var lines := code.split("\n")
+	for i in range(lines.size() - 1, -1, -1):
+		var line := lines[i].strip_edges()
+		if line.is_empty():
+			continue
+		if line.begins_with("#"):
+			continue
+		return line.begins_with("return")
+	return false
 
 
 func _success_response(id, result) -> String:
