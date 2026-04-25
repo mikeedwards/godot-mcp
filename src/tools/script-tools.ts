@@ -53,7 +53,7 @@ export function registerScriptTools(
   // Write a GDScript file
   tools.set("godot_write_script", {
     description:
-      "Create or update a GDScript file (.gd). Writes the provided content directly to the file.",
+      "Create or update a GDScript file (.gd). Writes the provided content directly to the file. The returned `metadata` is parsed from GDScript syntax; for non-`.gd` extensions the file is written verbatim but `metadata` fields will be empty arrays.",
     inputSchema: z.object({
       path: z.string().describe("Path where the script should be written"),
       content: z.string().describe("The GDScript content to write"),
