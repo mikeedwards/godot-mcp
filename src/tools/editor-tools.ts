@@ -619,39 +619,41 @@ export function registerEditorTools(
   tools.set("godot_runtime_click", {
     description:
       "Send a mouse click into the running game viewport, optionally moving first.",
-    inputSchema: z
-      .object({
-        x: z.number().optional().describe("Optional viewport-local X coordinate"),
-        y: z.number().optional().describe("Optional viewport-local Y coordinate"),
-        button: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .default(1)
-          .describe("Mouse button index (default: 1 for left click)"),
-        holdFrames: z
-          .number()
-          .int()
-          .positive()
-          .optional()
-          .default(1)
-          .describe("How many frames to hold the button before release"),
-      })
-      .refine(
-        (value) =>
-          (value.x === undefined && value.y === undefined) ||
-          (value.x !== undefined && value.y !== undefined),
-        { message: "Provide both x and y, or neither." }
-      ),
+    // Schema is a bare ZodObject (no `.refine`) so the SDK's
+    // normalizeObjectSchema can detect `.shape` and expose x/y/button/
+    // holdFrames over the wire. Cross-field validation (both x and y, or
+    // neither) is enforced by the handler instead.
+    inputSchema: z.object({
+      x: z.number().optional().describe("Optional viewport-local X coordinate"),
+      y: z.number().optional().describe("Optional viewport-local Y coordinate"),
+      button: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(1)
+        .describe("Mouse button index (default: 1 for left click)"),
+      holdFrames: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .default(1)
+        .describe("How many frames to hold the button before release"),
+    }),
     handler: async (args) => {
-      ensureConnected();
       const { x, y, button = 1, holdFrames = 1 } = args as {
         x?: number;
         y?: number;
         button?: number;
         holdFrames?: number;
       };
+
+      if ((x === undefined) !== (y === undefined)) {
+        throw new Error("Provide both x and y together, or neither.");
+      }
+
+      ensureConnected();
 
       const result = await sendRequest("runtime.click", {
         x,
