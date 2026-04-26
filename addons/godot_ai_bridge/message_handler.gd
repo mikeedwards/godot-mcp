@@ -11,6 +11,18 @@ const MAX_OUTPUT_LINES: int = 500
 const MAX_ERROR_COUNT: int = 100
 const LOG_LEVELS := ["debug", "info", "warning", "error"]
 
+# Session correlation: each run_scene rotates `_current_session_id` so callers
+# can filter `get_output` / `get_errors` to entries from a specific run.
+# Format: "<datetime>-<monotonic counter>" — sortable + human-readable.
+# `_log_file_session_cursor` is the godot.log line count at run_scene time;
+# log-file scrape entries at line >= cursor get tagged with the current
+# session and process_origin: "game" (cleaner attribution than the previous
+# "unknown" fallback).
+const PRE_RUN_SESSION: String = "pre-run"
+var _current_session_id: String = PRE_RUN_SESSION
+var _session_counter: int = 0
+var _log_file_session_cursor: int = 0
+
 
 func handle_message(message: String) -> String:
 	var json = JSON.new()
@@ -286,17 +298,40 @@ func _handle_save_scene(_params: Dictionary) -> Dictionary:
 
 
 func _handle_run_scene(params: Dictionary) -> Dictionary:
+	_session_counter += 1
+	_current_session_id = "%s-%d" % [
+		Time.get_datetime_string_from_system(),
+		_session_counter
+	]
+	_log_file_session_cursor = _count_current_log_file_lines()
 	var path: String = params.get("path", "")
 	if path.is_empty():
 		editor_interface.play_current_scene()
 	else:
 		editor_interface.play_custom_scene(path)
-	return {"result": {"running": true}}
+	return {"result": {"running": true, "session_id": _current_session_id}}
 
 
 func _handle_stop_scene(_params: Dictionary) -> Dictionary:
+	var ended_session_id: String = _current_session_id
+	_current_session_id = PRE_RUN_SESSION
 	editor_interface.stop_playing_scene()
-	return {"result": {"stopped": true}}
+	return {"result": {"stopped": true, "session_id": ended_session_id}}
+
+
+func _count_current_log_file_lines() -> int:
+	var log_info = _resolve_latest_log_file_path()
+	if log_info.has("error"):
+		return 0
+	var log_path: String = str(log_info.get("path", ""))
+	var file := FileAccess.open(log_path, FileAccess.READ)
+	if not file:
+		return 0
+	var count := 0
+	while not file.eof_reached():
+		file.get_line()
+		count += 1
+	return count
 
 
 func _handle_get_project_info(_params: Dictionary) -> Dictionary:
@@ -609,11 +644,20 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 	var query: String = str(params.get("query", "")).strip_edges()
 	var log_lines: int = int(params.get("log_lines", 200))
 	var clear: bool = params.get("clear", false)
+	var session_filter: String = str(params.get("session", "")).strip_edges()
+	var since_check := _validate_since_filter(params.get("since", null))
+	if not since_check.ok:
+		return {"error": {"code": -32602, "message": str(since_check.error)}}
+	var since_filter: String = str(since_check.value)
 	var source_counts := {"runtime": 0, "script": 0, "log_file": 0}
 
 	# Add runtime errors from buffer
 	if include_runtime:
 		for runtime_error in error_buffer:
+			if not _entry_matches_session(runtime_error, session_filter):
+				continue
+			if not _entry_matches_since(runtime_error, since_filter):
+				continue
 			if _error_matches(runtime_error, severity, query):
 				errors.append(runtime_error)
 				source_counts["runtime"] = int(source_counts["runtime"]) + 1
@@ -638,8 +682,15 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 							"message": error_string(err),
 							"type": "script_error",
 							"level": "error",
-							"source": "script_editor"
+							"source": "script_editor",
+							"session_id": _current_session_id,
+							"timestamp": Time.get_datetime_string_from_system(),
+							"timestamp_inferred": false,
 						}
+						if not _entry_matches_session(script_error, session_filter):
+							continue
+						if not _entry_matches_since(script_error, since_filter):
+							continue
 						if _error_matches(script_error, severity, query):
 							errors.append(script_error)
 							source_counts["script"] = int(source_counts["script"]) + 1
@@ -659,12 +710,17 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 					"level": level,
 					"source": "log_file",
 					"process_origin": str(log_entry.get("process_origin", "unknown")),
+					"session_id": str(log_entry.get("session_id", PRE_RUN_SESSION)),
 					"log_file": log_scan.get("log_file", ""),
 					"line_number": log_entry.get("line_number", 0),
 					"timestamp": log_entry.get("timestamp", ""),
 					"timestamp_inferred": bool(log_entry.get("timestamp_inferred", false)),
 					"message": log_entry.get("text", ""),
 				}
+				if not _entry_matches_session(mapped_error, session_filter):
+					continue
+				if not _entry_matches_since(mapped_error, since_filter):
+					continue
 				if _error_matches(mapped_error, severity, query):
 					errors.append(mapped_error)
 					source_counts["log_file"] = int(source_counts["log_file"]) + 1
@@ -699,9 +755,18 @@ func _handle_get_output(params: Dictionary) -> Dictionary:
 	var query: String = str(params.get("query", "")).strip_edges()
 	var clear: bool = params.get("clear", false)
 	var include_metadata: bool = params.get("include_metadata", true)
+	var session_filter: String = str(params.get("session", "")).strip_edges()
+	var since_check := _validate_since_filter(params.get("since", null))
+	if not since_check.ok:
+		return {"error": {"code": -32602, "message": str(since_check.error)}}
+	var since_filter: String = str(since_check.value)
 	var filtered_output: Array[Dictionary] = []
 
 	for entry in output_buffer:
+		if not _entry_matches_session(entry, session_filter):
+			continue
+		if not _entry_matches_since(entry, since_filter):
+			continue
 		if _output_entry_matches(entry, level, source, query):
 			filtered_output.append(entry)
 
@@ -839,6 +904,7 @@ func log_output(text: String, level: String = "info", source: String = "runtime"
 		"level": normalized_level,
 		"source": source,
 		"process_origin": _infer_process_origin(source),
+		"session_id": _current_session_id,
 		"message": message,
 		"line": line
 	})
@@ -865,6 +931,8 @@ func log_error(error_data: Dictionary) -> void:
 		entry["source"] = "runtime"
 	if not entry.has("process_origin"):
 		entry["process_origin"] = _infer_process_origin(str(entry["source"]))
+	if not entry.has("session_id"):
+		entry["session_id"] = _current_session_id
 	error_buffer.append(entry)
 
 	# Keep buffer size limited
@@ -929,6 +997,48 @@ func _extract_timestamp_from_line(line: String) -> String:
 	return ""
 
 
+func _entry_matches_session(entry: Dictionary, session_filter: String) -> bool:
+	if session_filter.is_empty():
+		return true
+	var entry_session: String = str(entry.get("session_id", PRE_RUN_SESSION))
+	return entry_session == session_filter
+
+
+func _validate_since_filter(since_raw: Variant) -> Dictionary:
+	# Returns {"ok": true, "value": String} for valid/empty, or
+	# {"ok": false, "error": String} for malformed input. Empty string
+	# means "no filter" — we deliberately avoid silently treating typos
+	# as "no filter" so a malformed value can't accidentally dump the
+	# entire buffer into the caller's context.
+	if since_raw == null:
+		return {"ok": true, "value": ""}
+	var since_str: String = str(since_raw).strip_edges()
+	if since_str.is_empty():
+		return {"ok": true, "value": ""}
+	var shape := RegEx.new()
+	if shape.compile("^\\d{4}-\\d{2}-\\d{2}") != OK:
+		return {"ok": true, "value": ""}
+	if not shape.search(since_str):
+		return {
+			"ok": false,
+			"error": "Invalid 'since' parameter: must be ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)."
+		}
+	return {"ok": true, "value": since_str}
+
+
+func _entry_matches_since(entry: Dictionary, since_filter: String) -> bool:
+	# ISO 8601 strings sort lexically — direct string compare is correct
+	# while both sides share format (YYYY-MM-DDTHH:MM:SS). For entries
+	# with timestamp_inferred=true (mtime fallback), compare uses the
+	# mtime; over-inclusion is acceptable (mtime >= actual emission).
+	if since_filter.is_empty():
+		return true
+	var entry_ts: String = str(entry.get("timestamp", ""))
+	if entry_ts.is_empty():
+		return false  # no timestamp = can't compare = exclude when filter active
+	return entry_ts >= since_filter
+
+
 func _infer_process_origin(source: String) -> String:
 	# Maps the bridge's existing `source` labels to the process that
 	# emitted the entry. Bridge addon code runs in the editor process;
@@ -949,6 +1059,15 @@ func _resolve_latest_log_file_path() -> Dictionary:
 	var dir := DirAccess.open(logs_dir)
 	if not dir:
 		return {"error": "Cannot access logs directory: " + logs_dir}
+
+	# Prefer the current-session log file (always named "godot.log") when
+	# present. Timestamped variants (godot<timestamp>.log) are archives of
+	# previous editor sessions whose mtimes can collide with godot.log at
+	# the moment of archiving — sorting by mtime alone is non-deterministic
+	# in that window and can resolve to the archive instead of the live file.
+	var current_path := logs_dir + "/godot.log"
+	if FileAccess.file_exists(current_path):
+		return {"path": current_path}
 
 	var log_files: Array[String] = []
 	dir.list_dir_begin()
@@ -1016,13 +1135,25 @@ func _scan_recent_log_entries(
 			line_ts = Time.get_datetime_string_from_unix_time(
 				int(FileAccess.get_modified_time(log_path))
 			)
+		# If a session is currently in flight (cursor was anchored at run_scene)
+		# and this line falls at or after the cursor, attribute it to that
+		# session and the running game. Otherwise tag as pre-run / unknown.
+		var line_session: String = PRE_RUN_SESSION
+		var line_origin: String = "unknown"
+		if (
+			_current_session_id != PRE_RUN_SESSION
+			and line_number >= _log_file_session_cursor
+		):
+			line_session = _current_session_id
+			line_origin = "game"
 		matched_entries.append({
 			"line_number": line_number,
 			"level": level,
 			"text": raw_line,
 			"timestamp": line_ts,
 			"timestamp_inferred": ts_inferred,
-			"process_origin": "unknown",
+			"process_origin": line_origin,
+			"session_id": line_session,
 		})
 
 	var recent_entries: Array[Dictionary] = _take_last_entries(matched_entries, lines)

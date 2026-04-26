@@ -298,6 +298,18 @@ export function registerEditorTools(
         .boolean()
         .optional()
         .describe("Clear in-memory runtime error buffer after retrieval"),
+      session: z
+        .string()
+        .optional()
+        .describe(
+          "Filter to entries from a specific session_id (returned by godot_editor_run_scene). Omit to return all sessions; pass 'pre-run' to scope to entries emitted before the first run."
+        ),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          "Return only entries with timestamp >= since (ISO 8601, e.g. '2026-04-26T13:45:00'). Malformed values produce an error rather than silently returning all entries — protects against typos dumping the whole buffer."
+        ),
     }),
     handler: async (args) => {
       ensureConnected();
@@ -309,6 +321,8 @@ export function registerEditorTools(
         query = "",
         logLines = 200,
         clear = false,
+        session = "",
+        since = "",
       } = args as {
         includeRuntime?: boolean;
         includeScript?: boolean;
@@ -317,12 +331,14 @@ export function registerEditorTools(
         query?: string;
         logLines?: number;
         clear?: boolean;
+        session?: string;
+        since?: string;
       };
 
       // Passthrough — bridge populates `timestamp`, `timestamp_inferred`,
-      // `process_origin`, and source-specific fields on each entry. Do NOT
-      // wrap `result` in a Zod schema parse here unless you know the full
-      // set of bridge-provided fields to preserve.
+      // `process_origin`, `session_id`, and source-specific fields on each
+      // entry. Do NOT wrap `result` in a Zod schema parse here unless you
+      // know the full set of bridge-provided fields to preserve.
       const result = await sendRequest("info.errors", {
         include_runtime: includeRuntime,
         include_script: includeScript,
@@ -331,6 +347,8 @@ export function registerEditorTools(
         query,
         log_lines: logLines,
         clear,
+        session,
+        since,
       });
       return result;
     },
@@ -365,6 +383,18 @@ export function registerEditorTools(
         .boolean()
         .optional()
         .describe("Clear in-memory output buffer after retrieval"),
+      session: z
+        .string()
+        .optional()
+        .describe(
+          "Filter to entries from a specific session_id (returned by godot_editor_run_scene). Omit to return all sessions; pass 'pre-run' to scope to entries emitted before the first run."
+        ),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          "Return only entries with timestamp >= since (ISO 8601, e.g. '2026-04-26T13:45:00'). Malformed values produce an error rather than silently returning all entries — protects against typos dumping the whole buffer."
+        ),
     }),
     handler: async (args) => {
       ensureConnected();
@@ -375,6 +405,8 @@ export function registerEditorTools(
         query = "",
         includeMetadata = true,
         clear = false,
+        session = "",
+        since = "",
       } = args as {
         lines?: number;
         level?: "all" | "error" | "warning" | "info" | "debug";
@@ -382,11 +414,13 @@ export function registerEditorTools(
         query?: string;
         includeMetadata?: boolean;
         clear?: boolean;
+        session?: string;
+        since?: string;
       };
 
       // Passthrough — see note on info.errors above. Bridge populates
-      // `timestamp`, `timestamp_inferred`, and `process_origin` on each
-      // entry; preserve verbatim.
+      // `timestamp`, `timestamp_inferred`, `process_origin`, and
+      // `session_id` on each entry; preserve verbatim.
       const result = await sendRequest("info.output", {
         lines,
         level,
@@ -394,6 +428,8 @@ export function registerEditorTools(
         query,
         include_metadata: includeMetadata,
         clear,
+        session,
+        since,
       });
       return result;
     },
