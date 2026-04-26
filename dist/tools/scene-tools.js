@@ -295,8 +295,24 @@ export function registerSceneTools(tools, state) {
                     nodeNames.add(`${node.parent}/${node.name}`);
                 }
             }
+            // Common foot-gun: a child of the root has parent="<RootNodeName>" instead
+            // of parent=".". The scene parses fine and the editor opens it, but at
+            // PackedScene.instantiate() time Godot warns "Parent path './<RootName>'
+            // for node '<X>' has vanished" and the node silently fails to attach.
+            // The path-walk below would otherwise find <RootName> in nodeNames (added
+            // for the actual root) and treat it as a valid ancestor, missing the bug.
+            const rootNode = scene.nodes.find((n) => !n.parent);
+            const rootName = rootNode?.name;
             for (const node of scene.nodes) {
                 if (node.parent && node.parent !== ".") {
+                    if (rootName && node.parent === rootName) {
+                        issues.push({
+                            severity: "error",
+                            message: `Node '${node.name}' has parent='${node.parent}' which matches the root node's name. Children of the root should use parent='.' instead — Godot's PackedScene.instantiate() will not resolve parent='${node.parent}' and the node will be dropped at runtime.`,
+                            location: `node name="${node.name}"`,
+                        });
+                        continue;
+                    }
                     // Check if parent exists
                     const parentParts = node.parent.split("/");
                     let currentPath = "";

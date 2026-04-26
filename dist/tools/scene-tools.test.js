@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { registerSceneTools } from './scene-tools.js';
 // Mock fs module
 vi.mock('fs/promises');
 // Import after mocking
@@ -69,6 +70,51 @@ describe('Scene Tools', () => {
             // Valid parent reference "." means root
             const validParentRef = sceneContent.includes('parent="."');
             expect(validParentRef).toBe(true);
+        });
+    });
+    describe('validate_scene catches parent="<root-name>" mistake', () => {
+        // Common foot-gun: a child of the root has parent="<RootNodeName>" instead of
+        // parent=".". Both forms write/parse fine, but only "." resolves at
+        // PackedScene.instantiate() — the other form silently drops the children.
+        // The validator should flag the wrong form so callers can correct it before
+        // the runtime warning ("Parent path './<RootName>' has vanished").
+        const setup = () => {
+            const tools = new Map();
+            registerSceneTools(tools, {
+                projectPath: testProjectPath,
+                editorConnected: false,
+                editorPort: 6550,
+            });
+            return tools.get('godot_validate_scene');
+        };
+        it('flags parent="<root-node-name>" as an error pointing at parent="."', async () => {
+            const sceneContent = `[gd_scene load_steps=1 format=3]
+
+[node name="RepoRoot" type="Node2D"]
+
+[node name="Inner" type="Node2D" parent="RepoRoot"]
+`;
+            mockFs.readFile.mockResolvedValue(sceneContent);
+            const validate = setup();
+            const result = await validate.handler({ scenePath: 'res://test.tscn' });
+            expect(result.valid).toBe(false);
+            expect(result.issues).toContainEqual(expect.objectContaining({
+                severity: 'error',
+                message: expect.stringContaining(`parent='.'`),
+            }));
+        });
+        it('does not false-positive on parent="." for direct children of root', async () => {
+            const sceneContent = `[gd_scene load_steps=1 format=3]
+
+[node name="RepoRoot" type="Node2D"]
+
+[node name="Inner" type="Node2D" parent="."]
+`;
+            mockFs.readFile.mockResolvedValue(sceneContent);
+            const validate = setup();
+            const result = await validate.handler({ scenePath: 'res://test.tscn' });
+            expect(result.valid).toBe(true);
+            expect(result.issues).toEqual([]);
         });
     });
     describe('node manipulation', () => {
