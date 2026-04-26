@@ -319,6 +319,10 @@ export function registerEditorTools(
         clear?: boolean;
       };
 
+      // Passthrough — bridge populates `timestamp`, `timestamp_inferred`,
+      // `process_origin`, and source-specific fields on each entry. Do NOT
+      // wrap `result` in a Zod schema parse here unless you know the full
+      // set of bridge-provided fields to preserve.
       const result = await sendRequest("info.errors", {
         include_runtime: includeRuntime,
         include_script: includeScript,
@@ -380,6 +384,9 @@ export function registerEditorTools(
         clear?: boolean;
       };
 
+      // Passthrough — see note on info.errors above. Bridge populates
+      // `timestamp`, `timestamp_inferred`, and `process_origin` on each
+      // entry; preserve verbatim.
       const result = await sendRequest("info.output", {
         lines,
         level,

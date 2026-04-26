@@ -249,6 +249,10 @@ export function registerEditorTools(tools, state) {
         handler: async (args) => {
             ensureConnected();
             const { includeRuntime = true, includeScript = true, includeLogFile = true, severity = "all", query = "", logLines = 200, clear = false, } = args;
+            // Passthrough — bridge populates `timestamp`, `timestamp_inferred`,
+            // `process_origin`, and source-specific fields on each entry. Do NOT
+            // wrap `result` in a Zod schema parse here unless you know the full
+            // set of bridge-provided fields to preserve.
             const result = await sendRequest("info.errors", {
                 include_runtime: includeRuntime,
                 include_script: includeScript,
@@ -293,6 +297,9 @@ export function registerEditorTools(tools, state) {
         handler: async (args) => {
             ensureConnected();
             const { lines = 50, level = "all", source = "all", query = "", includeMetadata = true, clear = false, } = args;
+            // Passthrough — see note on info.errors above. Bridge populates
+            // `timestamp`, `timestamp_inferred`, and `process_origin` on each
+            // entry; preserve verbatim.
             const result = await sendRequest("info.output", {
                 lines,
                 level,

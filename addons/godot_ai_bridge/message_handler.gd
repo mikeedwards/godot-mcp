@@ -658,9 +658,11 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 					"type": level,
 					"level": level,
 					"source": "log_file",
+					"process_origin": str(log_entry.get("process_origin", "unknown")),
 					"log_file": log_scan.get("log_file", ""),
 					"line_number": log_entry.get("line_number", 0),
 					"timestamp": log_entry.get("timestamp", ""),
+					"timestamp_inferred": bool(log_entry.get("timestamp_inferred", false)),
 					"message": log_entry.get("text", ""),
 				}
 				if _error_matches(mapped_error, severity, query):
@@ -833,8 +835,10 @@ func log_output(text: String, level: String = "info", source: String = "runtime"
 	var line = "[%s] %s" % [timestamp, message]
 	output_buffer.append({
 		"timestamp": timestamp,
+		"timestamp_inferred": false,
 		"level": normalized_level,
 		"source": source,
+		"process_origin": _infer_process_origin(source),
 		"message": message,
 		"line": line
 	})
@@ -849,6 +853,8 @@ func log_error(error_data: Dictionary) -> void:
 	var timestamp = Time.get_datetime_string_from_system()
 	if not entry.has("timestamp"):
 		entry["timestamp"] = timestamp
+	if not entry.has("timestamp_inferred"):
+		entry["timestamp_inferred"] = false
 	var level: String = _normalize_log_level(str(entry.get("level", entry.get("type", "error"))))
 	if level == "all":
 		level = _classify_log_level(str(entry.get("message", "")))
@@ -857,6 +863,8 @@ func log_error(error_data: Dictionary) -> void:
 		entry["type"] = level
 	if not entry.has("source"):
 		entry["source"] = "runtime"
+	if not entry.has("process_origin"):
+		entry["process_origin"] = _infer_process_origin(str(entry["source"]))
 	error_buffer.append(entry)
 
 	# Keep buffer size limited
@@ -906,14 +914,33 @@ func _line_matches_filter(line: String, line_level: String, filter_level: String
 
 
 func _extract_timestamp_from_line(line: String) -> String:
+	# Match a leading bracketed YYYY-MM-DD prefix (with optional time).
+	# Bracket-prefixed content that isn't an ISO-8601 date — e.g. stack
+	# frame indices like `[0]` or `[8]` in PushError / PushWarning output —
+	# must NOT be returned as a timestamp; the caller will fall back to
+	# the file mtime instead.
 	var regex := RegEx.new()
-	var compile_err = regex.compile("^\\[([^\\]]+)\\]")
+	var compile_err = regex.compile("^\\[(\\d{4}-\\d{2}-\\d{2}[^\\]]*)\\]")
 	if compile_err != OK:
 		return ""
 	var match = regex.search(line)
 	if match:
 		return match.get_string(1)
 	return ""
+
+
+func _infer_process_origin(source: String) -> String:
+	# Maps the bridge's existing `source` labels to the process that
+	# emitted the entry. Bridge addon code runs in the editor process;
+	# the debugger plugin captures messages from a separately-launched
+	# game process. Log files mix both with no in-line attribution.
+	match source:
+		"runtime", "debugger":
+			return "game"
+		"execute.gdscript", "script_editor", "script", "bridge", "editor":
+			return "editor"
+		_:
+			return "unknown"
 
 
 func _resolve_latest_log_file_path() -> Dictionary:
@@ -979,11 +1006,23 @@ func _scan_recent_log_entries(
 			continue
 
 		level_counts[level] = int(level_counts.get(level, 0)) + 1
+		var line_ts := _extract_timestamp_from_line(raw_line)
+		var ts_inferred := line_ts.is_empty()
+		if ts_inferred:
+			# Fall back to the log file's mtime so callers always have a
+			# usable value. `timestamp_inferred=true` flags the approximation
+			# — the line's actual emission time was earlier than the file's
+			# last-write time but we have no per-line truth.
+			line_ts = Time.get_datetime_string_from_unix_time(
+				int(FileAccess.get_modified_time(log_path))
+			)
 		matched_entries.append({
 			"line_number": line_number,
 			"level": level,
 			"text": raw_line,
-			"timestamp": _extract_timestamp_from_line(raw_line),
+			"timestamp": line_ts,
+			"timestamp_inferred": ts_inferred,
+			"process_origin": "unknown",
 		})
 
 	var recent_entries: Array[Dictionary] = _take_last_entries(matched_entries, lines)
