@@ -22,6 +22,9 @@ const PRE_RUN_SESSION: String = "pre-run"
 var _current_session_id: String = PRE_RUN_SESSION
 var _session_counter: int = 0
 var _log_file_session_cursor: int = 0
+var _run_started_at: String = ""
+# {session_id, started_at, exited_at, duration_ms} — null until first run ends.
+var _last_run_summary: Variant = null
 
 
 func handle_message(message: String) -> String:
@@ -303,6 +306,7 @@ func _handle_run_scene(params: Dictionary) -> Dictionary:
 		Time.get_datetime_string_from_system(),
 		_session_counter
 	]
+	_run_started_at = Time.get_datetime_string_from_system()
 	_log_file_session_cursor = _count_current_log_file_lines()
 	var path: String = params.get("path", "")
 	if path.is_empty():
@@ -314,9 +318,30 @@ func _handle_run_scene(params: Dictionary) -> Dictionary:
 
 func _handle_stop_scene(_params: Dictionary) -> Dictionary:
 	var ended_session_id: String = _current_session_id
-	_current_session_id = PRE_RUN_SESSION
+	record_run_ended()
 	editor_interface.stop_playing_scene()
 	return {"result": {"stopped": true, "session_id": ended_session_id}}
+
+
+# Called from BOTH _handle_stop_scene AND the debugger plugin's
+# _on_session_stopped (so closing the game window without going through MCP
+# stop_scene still captures last_run). First-write-wins guard prevents
+# double-counting when both paths fire for the same run.
+func record_run_ended() -> void:
+	if _current_session_id == PRE_RUN_SESSION:
+		return
+	var exited_at: String = Time.get_datetime_string_from_system()
+	var started_unix: int = int(Time.get_unix_time_from_datetime_string(_run_started_at))
+	var exited_unix: int = int(Time.get_unix_time_from_datetime_string(exited_at))
+	var duration_ms: int = max(0, (exited_unix - started_unix) * 1000)
+	_last_run_summary = {
+		"session_id": _current_session_id,
+		"started_at": _run_started_at,
+		"exited_at": exited_at,
+		"duration_ms": duration_ms,
+	}
+	_current_session_id = PRE_RUN_SESSION
+	_run_started_at = ""
 
 
 func _count_current_log_file_lines() -> int:
@@ -350,7 +375,17 @@ func _handle_refresh_filesystem(_params: Dictionary) -> Dictionary:
 
 
 func _handle_runtime_status(_params: Dictionary) -> Dictionary:
-	return await _send_runtime_request("status", {})
+	# When no run is in flight, surface the last-run summary instead of
+	# erroring. Lets callers ask "is the previous run still alive?" and
+	# "did stop_scene actually end it?" without needing OS-level forensics.
+	if _current_session_id == PRE_RUN_SESSION:
+		return {"result": {"running": false, "last_run": _last_run_summary}}
+	# Run in flight — delegate to runtime, then merge session_id so callers
+	# always see the run's identity in either branch.
+	var rt = await _send_runtime_request("status", {})
+	if rt.has("result") and rt.result is Dictionary:
+		(rt.result as Dictionary)["session_id"] = _current_session_id
+	return rt
 
 
 func _handle_runtime_wait(params: Dictionary) -> Dictionary:
