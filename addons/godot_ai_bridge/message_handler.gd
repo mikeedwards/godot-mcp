@@ -307,7 +307,7 @@ func _handle_run_scene(params: Dictionary) -> Dictionary:
 		_session_counter
 	]
 	_run_started_at = Time.get_datetime_string_from_system()
-	_log_file_session_cursor = _count_current_log_file_lines()
+	_log_file_session_cursor = _log_file_session_cursor_position()
 	var path: String = params.get("path", "")
 	if path.is_empty():
 		editor_interface.play_current_scene()
@@ -325,26 +325,51 @@ func _handle_stop_scene(_params: Dictionary) -> Dictionary:
 
 # Called from BOTH _handle_stop_scene AND the debugger plugin's
 # _on_session_stopped (so closing the game window without going through MCP
-# stop_scene still captures last_run). First-write-wins guard prevents
-# double-counting when both paths fire for the same run.
+# stop_scene still captures last_run). The first call from a stop path
+# captures session_id + started_at + exited_at + duration_ms. A follow-up
+# call (e.g., debugger _on_session_stopped after _handle_stop_scene already
+# fired) refines exited_at + duration_ms with its better-timed value while
+# preserving session_id and started_at — keeps the safety net while
+# letting the more authoritative timestamp win for the run's end.
 func record_run_ended() -> void:
-	if _current_session_id == PRE_RUN_SESSION:
-		return
 	var exited_at: String = Time.get_datetime_string_from_system()
-	var started_unix: int = int(Time.get_unix_time_from_datetime_string(_run_started_at))
 	var exited_unix: int = int(Time.get_unix_time_from_datetime_string(exited_at))
-	var duration_ms: int = max(0, (exited_unix - started_unix) * 1000)
-	_last_run_summary = {
-		"session_id": _current_session_id,
-		"started_at": _run_started_at,
-		"exited_at": exited_at,
-		"duration_ms": duration_ms,
-	}
-	_current_session_id = PRE_RUN_SESSION
-	_run_started_at = ""
+
+	# Path 1: a session is in flight. This is the initial record.
+	if _current_session_id != PRE_RUN_SESSION:
+		if _run_started_at.is_empty():
+			return  # defensive: shouldn't happen, but don't fabricate a unix-epoch-to-now duration
+		var started_unix: int = int(Time.get_unix_time_from_datetime_string(_run_started_at))
+		_last_run_summary = {
+			"session_id": _current_session_id,
+			"started_at": _run_started_at,
+			"exited_at": exited_at,
+			"duration_ms": max(0, (exited_unix - started_unix) * 1000),
+		}
+		_current_session_id = PRE_RUN_SESSION
+		_run_started_at = ""
+		return
+
+	# Path 2: session already finalized by an earlier path (typically
+	# _handle_stop_scene fired before the debugger's _on_session_stopped).
+	# Refine exited_at + duration_ms with the more authoritative value;
+	# session_id and started_at are preserved.
+	if _last_run_summary == null:
+		return
+	var summary: Dictionary = _last_run_summary as Dictionary
+	var prior_started_at: String = str(summary.get("started_at", ""))
+	if prior_started_at.is_empty():
+		return
+	var prior_started_unix: int = int(Time.get_unix_time_from_datetime_string(prior_started_at))
+	summary["exited_at"] = exited_at
+	summary["duration_ms"] = max(0, (exited_unix - prior_started_unix) * 1000)
 
 
-func _count_current_log_file_lines() -> int:
+func _log_file_session_cursor_position() -> int:
+	# Returns the line number at which entries from the next emission will
+	# start in godot.log — i.e. one past the last existing line. Matches
+	# the semantics needed by `_log_file_session_cursor`: any scraped line
+	# at >= cursor was written after this anchor was set.
 	var log_info = _resolve_latest_log_file_path()
 	if log_info.has("error"):
 		return 0
