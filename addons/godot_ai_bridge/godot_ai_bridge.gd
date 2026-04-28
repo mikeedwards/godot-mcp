@@ -240,6 +240,10 @@ class AIBridgeDebuggerPlugin extends EditorDebuggerPlugin:
 				"info",
 				"debugger"
 			)
+			# Capture last_run timing for runtime_status. First-write-wins
+			# guard inside record_run_ended prevents double-counting if
+			# stop_scene was the trigger and already finalized the run.
+			message_handler.record_run_ended()
 
 	func _get_active_session_id() -> int:
 		for i in range(_tracked_session_ids.size() - 1, -1, -1):

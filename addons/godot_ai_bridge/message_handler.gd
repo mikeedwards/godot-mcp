@@ -11,6 +11,21 @@ const MAX_OUTPUT_LINES: int = 500
 const MAX_ERROR_COUNT: int = 100
 const LOG_LEVELS := ["debug", "info", "warning", "error"]
 
+# Session correlation: each run_scene rotates `_current_session_id` so callers
+# can filter `get_output` / `get_errors` to entries from a specific run.
+# Format: "<datetime>-<monotonic counter>" — sortable + human-readable.
+# `_log_file_session_cursor` is the godot.log line count at run_scene time;
+# log-file scrape entries at line >= cursor get tagged with the current
+# session and process_origin: "game" (cleaner attribution than the previous
+# "unknown" fallback).
+const PRE_RUN_SESSION: String = "pre-run"
+var _current_session_id: String = PRE_RUN_SESSION
+var _session_counter: int = 0
+var _log_file_session_cursor: int = 0
+var _run_started_at: String = ""
+# {session_id, started_at, exited_at, duration_ms} — null until first run ends.
+var _last_run_summary: Variant = null
+
 
 func handle_message(message: String) -> String:
 	var json = JSON.new()
@@ -286,17 +301,87 @@ func _handle_save_scene(_params: Dictionary) -> Dictionary:
 
 
 func _handle_run_scene(params: Dictionary) -> Dictionary:
+	_session_counter += 1
+	_current_session_id = "%s-%d" % [
+		Time.get_datetime_string_from_system(),
+		_session_counter
+	]
+	_run_started_at = Time.get_datetime_string_from_system()
+	_log_file_session_cursor = _log_file_session_cursor_position()
 	var path: String = params.get("path", "")
 	if path.is_empty():
 		editor_interface.play_current_scene()
 	else:
 		editor_interface.play_custom_scene(path)
-	return {"result": {"running": true}}
+	return {"result": {"running": true, "session_id": _current_session_id}}
 
 
 func _handle_stop_scene(_params: Dictionary) -> Dictionary:
+	var ended_session_id: String = _current_session_id
+	record_run_ended()
 	editor_interface.stop_playing_scene()
-	return {"result": {"stopped": true}}
+	return {"result": {"stopped": true, "session_id": ended_session_id}}
+
+
+# Called from BOTH _handle_stop_scene AND the debugger plugin's
+# _on_session_stopped (so closing the game window without going through MCP
+# stop_scene still captures last_run). The first call from a stop path
+# captures session_id + started_at + exited_at + duration_ms. A follow-up
+# call (e.g., debugger _on_session_stopped after _handle_stop_scene already
+# fired) refines exited_at + duration_ms with its better-timed value while
+# preserving session_id and started_at — keeps the safety net while
+# letting the more authoritative timestamp win for the run's end.
+func record_run_ended() -> void:
+	var exited_at: String = Time.get_datetime_string_from_system()
+	var exited_unix: int = int(Time.get_unix_time_from_datetime_string(exited_at))
+
+	# Path 1: a session is in flight. This is the initial record.
+	if _current_session_id != PRE_RUN_SESSION:
+		if _run_started_at.is_empty():
+			return  # defensive: shouldn't happen, but don't fabricate a unix-epoch-to-now duration
+		var started_unix: int = int(Time.get_unix_time_from_datetime_string(_run_started_at))
+		_last_run_summary = {
+			"session_id": _current_session_id,
+			"started_at": _run_started_at,
+			"exited_at": exited_at,
+			"duration_ms": max(0, (exited_unix - started_unix) * 1000),
+		}
+		_current_session_id = PRE_RUN_SESSION
+		_run_started_at = ""
+		return
+
+	# Path 2: session already finalized by an earlier path (typically
+	# _handle_stop_scene fired before the debugger's _on_session_stopped).
+	# Refine exited_at + duration_ms with the more authoritative value;
+	# session_id and started_at are preserved.
+	if _last_run_summary == null:
+		return
+	var summary: Dictionary = _last_run_summary as Dictionary
+	var prior_started_at: String = str(summary.get("started_at", ""))
+	if prior_started_at.is_empty():
+		return
+	var prior_started_unix: int = int(Time.get_unix_time_from_datetime_string(prior_started_at))
+	summary["exited_at"] = exited_at
+	summary["duration_ms"] = max(0, (exited_unix - prior_started_unix) * 1000)
+
+
+func _log_file_session_cursor_position() -> int:
+	# Returns the line number at which entries from the next emission will
+	# start in godot.log — i.e. one past the last existing line. Matches
+	# the semantics needed by `_log_file_session_cursor`: any scraped line
+	# at >= cursor was written after this anchor was set.
+	var log_info = _resolve_latest_log_file_path()
+	if log_info.has("error"):
+		return 0
+	var log_path: String = str(log_info.get("path", ""))
+	var file := FileAccess.open(log_path, FileAccess.READ)
+	if not file:
+		return 0
+	var count := 0
+	while not file.eof_reached():
+		file.get_line()
+		count += 1
+	return count
 
 
 func _handle_get_project_info(_params: Dictionary) -> Dictionary:
@@ -315,7 +400,17 @@ func _handle_refresh_filesystem(_params: Dictionary) -> Dictionary:
 
 
 func _handle_runtime_status(_params: Dictionary) -> Dictionary:
-	return await _send_runtime_request("status", {})
+	# When no run is in flight, surface the last-run summary instead of
+	# erroring. Lets callers ask "is the previous run still alive?" and
+	# "did stop_scene actually end it?" without needing OS-level forensics.
+	if _current_session_id == PRE_RUN_SESSION:
+		return {"result": {"running": false, "last_run": _last_run_summary}}
+	# Run in flight — delegate to runtime, then merge session_id so callers
+	# always see the run's identity in either branch.
+	var rt = await _send_runtime_request("status", {})
+	if rt.has("result") and rt.result is Dictionary:
+		(rt.result as Dictionary)["session_id"] = _current_session_id
+	return rt
 
 
 func _handle_runtime_wait(params: Dictionary) -> Dictionary:
@@ -609,11 +704,20 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 	var query: String = str(params.get("query", "")).strip_edges()
 	var log_lines: int = int(params.get("log_lines", 200))
 	var clear: bool = params.get("clear", false)
+	var session_filter: String = str(params.get("session", "")).strip_edges()
+	var since_check := _validate_since_filter(params.get("since", null))
+	if not since_check.ok:
+		return {"error": {"code": -32602, "message": str(since_check.error)}}
+	var since_filter: String = str(since_check.value)
 	var source_counts := {"runtime": 0, "script": 0, "log_file": 0}
 
 	# Add runtime errors from buffer
 	if include_runtime:
 		for runtime_error in error_buffer:
+			if not _entry_matches_session(runtime_error, session_filter):
+				continue
+			if not _entry_matches_since(runtime_error, since_filter):
+				continue
 			if _error_matches(runtime_error, severity, query):
 				errors.append(runtime_error)
 				source_counts["runtime"] = int(source_counts["runtime"]) + 1
@@ -638,8 +742,15 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 							"message": error_string(err),
 							"type": "script_error",
 							"level": "error",
-							"source": "script_editor"
+							"source": "script_editor",
+							"session_id": _current_session_id,
+							"timestamp": Time.get_datetime_string_from_system(),
+							"timestamp_inferred": false,
 						}
+						if not _entry_matches_session(script_error, session_filter):
+							continue
+						if not _entry_matches_since(script_error, since_filter):
+							continue
 						if _error_matches(script_error, severity, query):
 							errors.append(script_error)
 							source_counts["script"] = int(source_counts["script"]) + 1
@@ -658,11 +769,18 @@ func _handle_get_errors(params: Dictionary) -> Dictionary:
 					"type": level,
 					"level": level,
 					"source": "log_file",
+					"process_origin": str(log_entry.get("process_origin", "unknown")),
+					"session_id": str(log_entry.get("session_id", PRE_RUN_SESSION)),
 					"log_file": log_scan.get("log_file", ""),
 					"line_number": log_entry.get("line_number", 0),
 					"timestamp": log_entry.get("timestamp", ""),
+					"timestamp_inferred": bool(log_entry.get("timestamp_inferred", false)),
 					"message": log_entry.get("text", ""),
 				}
+				if not _entry_matches_session(mapped_error, session_filter):
+					continue
+				if not _entry_matches_since(mapped_error, since_filter):
+					continue
 				if _error_matches(mapped_error, severity, query):
 					errors.append(mapped_error)
 					source_counts["log_file"] = int(source_counts["log_file"]) + 1
@@ -697,9 +815,18 @@ func _handle_get_output(params: Dictionary) -> Dictionary:
 	var query: String = str(params.get("query", "")).strip_edges()
 	var clear: bool = params.get("clear", false)
 	var include_metadata: bool = params.get("include_metadata", true)
+	var session_filter: String = str(params.get("session", "")).strip_edges()
+	var since_check := _validate_since_filter(params.get("since", null))
+	if not since_check.ok:
+		return {"error": {"code": -32602, "message": str(since_check.error)}}
+	var since_filter: String = str(since_check.value)
 	var filtered_output: Array[Dictionary] = []
 
 	for entry in output_buffer:
+		if not _entry_matches_session(entry, session_filter):
+			continue
+		if not _entry_matches_since(entry, since_filter):
+			continue
 		if _output_entry_matches(entry, level, source, query):
 			filtered_output.append(entry)
 
@@ -833,8 +960,11 @@ func log_output(text: String, level: String = "info", source: String = "runtime"
 	var line = "[%s] %s" % [timestamp, message]
 	output_buffer.append({
 		"timestamp": timestamp,
+		"timestamp_inferred": false,
 		"level": normalized_level,
 		"source": source,
+		"process_origin": _infer_process_origin(source),
+		"session_id": _current_session_id,
 		"message": message,
 		"line": line
 	})
@@ -849,6 +979,8 @@ func log_error(error_data: Dictionary) -> void:
 	var timestamp = Time.get_datetime_string_from_system()
 	if not entry.has("timestamp"):
 		entry["timestamp"] = timestamp
+	if not entry.has("timestamp_inferred"):
+		entry["timestamp_inferred"] = false
 	var level: String = _normalize_log_level(str(entry.get("level", entry.get("type", "error"))))
 	if level == "all":
 		level = _classify_log_level(str(entry.get("message", "")))
@@ -857,6 +989,10 @@ func log_error(error_data: Dictionary) -> void:
 		entry["type"] = level
 	if not entry.has("source"):
 		entry["source"] = "runtime"
+	if not entry.has("process_origin"):
+		entry["process_origin"] = _infer_process_origin(str(entry["source"]))
+	if not entry.has("session_id"):
+		entry["session_id"] = _current_session_id
 	error_buffer.append(entry)
 
 	# Keep buffer size limited
@@ -906,8 +1042,13 @@ func _line_matches_filter(line: String, line_level: String, filter_level: String
 
 
 func _extract_timestamp_from_line(line: String) -> String:
+	# Match a leading bracketed YYYY-MM-DD prefix (with optional time).
+	# Bracket-prefixed content that isn't an ISO-8601 date — e.g. stack
+	# frame indices like `[0]` or `[8]` in PushError / PushWarning output —
+	# must NOT be returned as a timestamp; the caller will fall back to
+	# the file mtime instead.
 	var regex := RegEx.new()
-	var compile_err = regex.compile("^\\[([^\\]]+)\\]")
+	var compile_err = regex.compile("^\\[(\\d{4}-\\d{2}-\\d{2}[^\\]]*)\\]")
 	if compile_err != OK:
 		return ""
 	var match = regex.search(line)
@@ -916,12 +1057,77 @@ func _extract_timestamp_from_line(line: String) -> String:
 	return ""
 
 
+func _entry_matches_session(entry: Dictionary, session_filter: String) -> bool:
+	if session_filter.is_empty():
+		return true
+	var entry_session: String = str(entry.get("session_id", PRE_RUN_SESSION))
+	return entry_session == session_filter
+
+
+func _validate_since_filter(since_raw: Variant) -> Dictionary:
+	# Returns {"ok": true, "value": String} for valid/empty, or
+	# {"ok": false, "error": String} for malformed input. Empty string
+	# means "no filter" — we deliberately avoid silently treating typos
+	# as "no filter" so a malformed value can't accidentally dump the
+	# entire buffer into the caller's context.
+	if since_raw == null:
+		return {"ok": true, "value": ""}
+	var since_str: String = str(since_raw).strip_edges()
+	if since_str.is_empty():
+		return {"ok": true, "value": ""}
+	var shape := RegEx.new()
+	if shape.compile("^\\d{4}-\\d{2}-\\d{2}") != OK:
+		return {"ok": true, "value": ""}
+	if not shape.search(since_str):
+		return {
+			"ok": false,
+			"error": "Invalid 'since' parameter: must be ISO 8601 datetime (YYYY-MM-DDTHH:MM:SS)."
+		}
+	return {"ok": true, "value": since_str}
+
+
+func _entry_matches_since(entry: Dictionary, since_filter: String) -> bool:
+	# ISO 8601 strings sort lexically — direct string compare is correct
+	# while both sides share format (YYYY-MM-DDTHH:MM:SS). For entries
+	# with timestamp_inferred=true (mtime fallback), compare uses the
+	# mtime; over-inclusion is acceptable (mtime >= actual emission).
+	if since_filter.is_empty():
+		return true
+	var entry_ts: String = str(entry.get("timestamp", ""))
+	if entry_ts.is_empty():
+		return false  # no timestamp = can't compare = exclude when filter active
+	return entry_ts >= since_filter
+
+
+func _infer_process_origin(source: String) -> String:
+	# Maps the bridge's existing `source` labels to the process that
+	# emitted the entry. Bridge addon code runs in the editor process;
+	# the debugger plugin captures messages from a separately-launched
+	# game process. Log files mix both with no in-line attribution.
+	match source:
+		"runtime", "debugger":
+			return "game"
+		"execute.gdscript", "script_editor", "script", "bridge", "editor":
+			return "editor"
+		_:
+			return "unknown"
+
+
 func _resolve_latest_log_file_path() -> Dictionary:
 	var user_path := OS.get_user_data_dir()
 	var logs_dir := user_path + "/logs"
 	var dir := DirAccess.open(logs_dir)
 	if not dir:
 		return {"error": "Cannot access logs directory: " + logs_dir}
+
+	# Prefer the current-session log file (always named "godot.log") when
+	# present. Timestamped variants (godot<timestamp>.log) are archives of
+	# previous editor sessions whose mtimes can collide with godot.log at
+	# the moment of archiving — sorting by mtime alone is non-deterministic
+	# in that window and can resolve to the archive instead of the live file.
+	var current_path := logs_dir + "/godot.log"
+	if FileAccess.file_exists(current_path):
+		return {"path": current_path}
 
 	var log_files: Array[String] = []
 	dir.list_dir_begin()
@@ -979,11 +1185,35 @@ func _scan_recent_log_entries(
 			continue
 
 		level_counts[level] = int(level_counts.get(level, 0)) + 1
+		var line_ts := _extract_timestamp_from_line(raw_line)
+		var ts_inferred := line_ts.is_empty()
+		if ts_inferred:
+			# Fall back to the log file's mtime so callers always have a
+			# usable value. `timestamp_inferred=true` flags the approximation
+			# — the line's actual emission time was earlier than the file's
+			# last-write time but we have no per-line truth.
+			line_ts = Time.get_datetime_string_from_unix_time(
+				int(FileAccess.get_modified_time(log_path))
+			)
+		# If a session is currently in flight (cursor was anchored at run_scene)
+		# and this line falls at or after the cursor, attribute it to that
+		# session and the running game. Otherwise tag as pre-run / unknown.
+		var line_session: String = PRE_RUN_SESSION
+		var line_origin: String = "unknown"
+		if (
+			_current_session_id != PRE_RUN_SESSION
+			and line_number >= _log_file_session_cursor
+		):
+			line_session = _current_session_id
+			line_origin = "game"
 		matched_entries.append({
 			"line_number": line_number,
 			"level": level,
 			"text": raw_line,
-			"timestamp": _extract_timestamp_from_line(raw_line),
+			"timestamp": line_ts,
+			"timestamp_inferred": ts_inferred,
+			"process_origin": line_origin,
+			"session_id": line_session,
 		})
 
 	var recent_entries: Array[Dictionary] = _take_last_entries(matched_entries, lines)
